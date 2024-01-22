@@ -8,12 +8,16 @@ DECLARE_STATS_GROUP(TEXT("BoidSimulation"), STATGROUP_BoidSimulation, STATCAT_Ad
 
 DECLARE_CYCLE_STAT(TEXT("Simulate (GT)"), STAT_Simulate_GameThread, STATGROUP_BoidSimulation);
 DECLARE_CYCLE_STAT(TEXT("Simulate (Task)"), STAT_Simulate_WorkerThread, STATGROUP_BoidSimulation);
+DECLARE_CYCLE_STAT(TEXT("Initialize Directions"), STAT_InitializeDirections, STATGROUP_BoidSimulation);
+DECLARE_CYCLE_STAT(TEXT("Find Nearby Boids"), STAT_FindNearbyBoids, STATGROUP_BoidSimulation);
+DECLARE_CYCLE_STAT(TEXT("Relocate Boid Cells"), STAT_RelocateBoidCells, STATGROUP_BoidSimulation);
+DECLARE_CYCLE_STAT(TEXT("Relocate Boid Cells Blocking Time"), STAT_RelocateBoidCellsBlockingTime, STATGROUP_BoidSimulation);
 
 namespace BoidSimulationCVars
 {
-static TAutoConsoleVariable<bool> UseMultithreading{
-	TEXT("BoidSimulation.UseMultithreading"),
-	false,
+static TAutoConsoleVariable<bool> EnableMultithreading{
+	TEXT("BoidSimulation.EnableMultithreading"),
+	true,
 	TEXT("")};
 
 static TAutoConsoleVariable<int32> BatchSize{
@@ -48,6 +52,7 @@ AFlock::AFlock(const FObjectInitializer& ObjectInitializer)
 	
 	Mesh = ObjectInitializer.CreateDefaultSubobject<UInstancedStaticMeshComponent>(this, TEXT("Mesh"));
 	Mesh->SetCollisionProfileName(UCollisionProfile::NoCollision_ProfileName);
+	Mesh->SetCanEverAffectNavigation(false);
 	SetRootComponent(Mesh);
 }
 
@@ -58,6 +63,10 @@ void AFlock::BeginPlay()
 	checkf(NumInstances > 0, TEXT("NumInstances == %i"), NumInstances);
 	checkf(BoundsRadius > 0.f, TEXT("Radius == %f"), BoundsRadius);
 
+	const int32 NumCells = GetNumCells();
+	BoidCells.SetNum(NumCells);
+	BoidCellSpinLocks.SetNum(NumCells);
+
 	TArray<FTransform> Transforms;
 	Transforms.Reserve(NumInstances);
 	
@@ -66,6 +75,8 @@ void AFlock::BeginPlay()
 		const FVector RandomLocation = FMath::VRand() * FMath::RandRange(0.0, static_cast<double>(BoundsRadius));
 		const FRotator RandomRotation = FRotator{FMath::RandRange(-180.0, 180.0), FMath::RandRange(-180.0, 180.0), 0.0};
 		Transforms.Emplace(RandomRotation, RandomLocation);
+
+		BoidCells[GetCellIndex(RandomLocation)].Add(i);
 	}
 
 	Mesh->AddInstances(Transforms, false, false);
@@ -81,7 +92,7 @@ UE_NODISCARD FORCEINLINE FVector LerpNormals(const FVector& A, const FVector& B,
 	return FQuat{Axis, Angle * Alpha}.RotateVector(A);
 }
 
-void AFlock::Cohere(const TArrayView<FVector>& Directions, const int32 BoidIndex, const TConstArrayView<int32>& OtherRelevantBoidIndices) const
+void AFlock::Cohere(FVector& RESTRICT OutDirection, const TConstArrayView<FVector>& Directions, const int32 BoidIndex, const TConstArrayView<int32>& OtherRelevantBoidIndices) const
 {
 	DECLARE_SCOPE_CYCLE_COUNTER(TEXT("Cohere"), STAT_Cohere, STATGROUP_BoidSimulation);
 
@@ -103,17 +114,30 @@ void AFlock::Cohere(const TArrayView<FVector>& Directions, const int32 BoidIndex
 	const FVector DirToAverageLocation = (AverageLocation - Transform.GetTranslation()).GetSafeNormal();
 	
 	const double Alpha = FMath::GetMappedRangeValueClamped<double, double>({0.0, 15.0}, {0.0, BoidSimulationCVars::CohesionStrength.GetValueOnAnyThread()}, static_cast<double>(OtherRelevantBoidIndices.Num()));
-	Directions[BoidIndex] = LerpNormals(Directions[BoidIndex], DirToAverageLocation, Alpha);
+	OutDirection = LerpNormals(OutDirection, DirToAverageLocation, Alpha);
 }
 
-void AFlock::Avoid(const TArrayView<FVector>& Directions, const int32 BoidIndex, const TConstArrayView<int32>& OtherRelevantBoidIndices) const
+void AFlock::RelocateBoidCell(const int32 BoidIndex, const FVector& LastLocation, const FVector& NewLocation)
+{
+	SCOPE_CYCLE_COUNTER(STAT_RelocateBoidCells);
+	
+	const int32 LastCell = GetCellIndex(LastLocation);
+	const int32 NewCell = GetCellIndex(NewLocation);
+	if (LastCell == NewCell) return;
+
+	verify(BoidCells[LastCell].RemoveSingle(BoidIndex) != INDEX_NONE);
+	check(!BoidCells[NewCell].Contains(BoidIndex));
+	BoidCells[NewCell].Add(BoidIndex);
+}
+
+void AFlock::Avoid(FVector& RESTRICT OutDirection, const TConstArrayView<FVector>& Directions, const int32 BoidIndex, const TConstArrayView<int32>& OtherRelevantBoidIndices) const
 {
 	DECLARE_SCOPE_CYCLE_COUNTER(TEXT("Avoid"), STAT_Avoid, STATGROUP_BoidSimulation);
 	
 	FTransform Transform{NoInit};
 	Mesh->GetInstanceTransform(BoidIndex, Transform);
 
-	FVector NewDirection = Directions[BoidIndex];
+	FVector NewDirection = OutDirection;
 
 	for (const int32 OtherBoidIndex : OtherRelevantBoidIndices)
 	{
@@ -130,10 +154,10 @@ void AFlock::Avoid(const TArrayView<FVector>& Directions, const int32 BoidIndex,
 
 	NewDirection.Normalize();
 	
-	Directions[BoidIndex] = NewDirection;
+	OutDirection = NewDirection;
 }
 
-void AFlock::Align(const TArrayView<FVector>& Directions, const int32 BoidIndex, const TConstArrayView<int32>& OtherRelevantBoidIndices) const
+void AFlock::Align(FVector& RESTRICT OutDirection, const TConstArrayView<FVector>& Directions, const int32 BoidIndex, const TConstArrayView<int32>& OtherRelevantBoidIndices) const
 {
 	DECLARE_SCOPE_CYCLE_COUNTER(TEXT("Align"), STAT_Align, STATGROUP_BoidSimulation);
 
@@ -148,10 +172,10 @@ void AFlock::Align(const TArrayView<FVector>& Directions, const int32 BoidIndex,
 	AverageDirection.Normalize();
 
 	const double Alpha = FMath::Min(1.0, static_cast<double>(OtherRelevantBoidIndices.Num()) / 15.0) * BoidSimulationCVars::AlignmentStrength.GetValueOnAnyThread();
-	Directions[BoidIndex] = LerpNormals(Directions[BoidIndex], AverageDirection, Alpha);
+	OutDirection = LerpNormals(OutDirection, AverageDirection, Alpha);
 }
 
-void AFlock::Constrain(FVector& Direction, const int32 BoidIndex) const
+void AFlock::Constrain(FVector& OutDirection, const int32 BoidIndex) const
 {
 	DECLARE_SCOPE_CYCLE_COUNTER(TEXT("Constrain"), STAT_Constrain, STATGROUP_BoidSimulation);
 	
@@ -164,13 +188,13 @@ void AFlock::Constrain(FVector& Direction, const int32 BoidIndex) const
 		const double DistFromOrigin = Transform.GetTranslation().Size();
 		const FVector DirFromOrigin = Transform.GetTranslation() / DistFromOrigin;
 		
-		FVector RightAxis = Direction ^ DirFromOrigin;
-
+		FVector RightAxis = OutDirection ^ DirFromOrigin;
+		
 		FVector TargetDirection;
 		if (LIKELY(RightAxis.SizeSquared() > UE_DOUBLE_KINDA_SMALL_NUMBER))
 		{
 			RightAxis = RightAxis.GetUnsafeNormal();
-			TargetDirection = RightAxis.RotateAngleAxisRad(UE_DOUBLE_PI / 2.0, DirFromOrigin).RotateAngleAxisRad(-UE_DOUBLE_PI / 4.0, RightAxis);
+			TargetDirection = RightAxis.RotateAngleAxisRad(UE_DOUBLE_PI / 2.0, DirFromOrigin).RotateAngleAxisRad(-UE_DOUBLE_PI / 2.0, RightAxis);
 		}
 		else
 		{
@@ -178,54 +202,84 @@ void AFlock::Constrain(FVector& Direction, const int32 BoidIndex) const
 		}
 
 		const double Alpha = FMath::GetMappedRangeValueUnclamped<double, double>({BoundsRadius - BoidsSearchNearbyRadius - UE_DOUBLE_KINDA_SMALL_NUMBER, BoundsRadius}, {0.0, 1.0}, DistFromOrigin);
-		Direction = LerpNormals(Direction, TargetDirection, Alpha);
+		OutDirection = LerpNormals(OutDirection, TargetDirection, Alpha);
 	}
 }
 
 void AFlock::SimulateSynchronously(float DeltaTime)
 {
 	SCOPE_CYCLE_COUNTER(STAT_Simulate_GameThread);
-
+	
 	TArray<FVector> Directions;
-	Directions.Reserve(NumInstances);
-	for (int32 i = 0; i < NumInstances; ++i)
 	{
-		FTransform Transform{NoInit};
-		verify(Mesh->GetInstanceTransform(i, Transform));
-		Directions.Add(Transform.GetUnitAxis(EAxis::X));
+		SCOPE_CYCLE_COUNTER(STAT_InitializeDirections);
+		
+		Directions.Reserve(NumInstances);
+		for (int32 i = 0; i < NumInstances; ++i)
+		{
+			FTransform Transform{NoInit};
+			verify(Mesh->GetInstanceTransform(i, Transform));
+			Directions.Add(Transform.GetUnitAxis(EAxis::X));
+		}
 	}
 
 	TArray<int32, TInlineAllocator<32>> OtherRelevantBoids;// Declared out here to preserve slack
 	for (int32 i = 0; i < NumInstances; ++i)
 	{
-		FTransform Transform{NoInit};
-		Mesh->GetInstanceTransform(i, Transform);
-
+		FVector NewDirection = Directions[i];// Working with a copy rather than a reference to avoid false-sharing.
 		{
-			DECLARE_SCOPE_CYCLE_COUNTER(TEXT("Find Nearby Boids"), STAT_FindNearbyBoids, STATGROUP_BoidSimulation);
+			SCOPE_CYCLE_COUNTER(STAT_FindNearbyBoids);
+
+			FTransform Transform{NoInit};
+			Mesh->GetInstanceTransform(i, Transform);
 			
 			OtherRelevantBoids.Reset();
-			for (int32 j = 0; j < NumInstances; ++j)
+#if 0
+			DrawDebugSphere(GetWorld(), GetActorTransform().TransformPosition(Transform.GetTranslation()), BoidsSearchNearbyRadius, 8, FColor::Green);
+			
+			const FVector Location = Transform.GetTranslation();
+
+			const int32 CellDimensions = GetCellDimensions();
+			
+			const int32 StartX = FMath::Clamp(FMath::RoundToInt32((Location.X - BoidsSearchNearbyRadius + BoundsRadius) / CELL_SIZE), 0, CellDimensions - 1);
+			const int32 EndX = FMath::Clamp(FMath::RoundToInt32((Location.X + BoidsSearchNearbyRadius + BoundsRadius) / CELL_SIZE), 0, CellDimensions - 1);
+
+			const int32 StartY = FMath::Clamp(FMath::RoundToInt32((Location.Y - BoidsSearchNearbyRadius + BoundsRadius) / CELL_SIZE), 0, CellDimensions - 1);
+			const int32 EndY = FMath::Clamp(FMath::RoundToInt32((Location.Y + BoidsSearchNearbyRadius + BoundsRadius) / CELL_SIZE), 0.0, CellDimensions - 1);
+
+			const int32 StartZ = FMath::Clamp(FMath::RoundToInt32((Location.Z - BoidsSearchNearbyRadius + BoundsRadius) / CELL_SIZE), 0, CellDimensions - 1);
+			const int32 EndZ = FMath::Clamp(FMath::RoundToInt32((Location.Z + BoidsSearchNearbyRadius + BoundsRadius) / CELL_SIZE), 0, CellDimensions - 1);
+
+			for (int32 Z = StartZ; Z < EndZ + 1; ++Z)
 			{
-				if (UNLIKELY(i == j)) continue;
-
-				FTransform OtherTransform{NoInit};
-				Mesh->GetInstanceTransform(j, OtherTransform);
-
-				const FVector Translation = FTransform::SubtractTranslations(Transform, OtherTransform);
-
-				// Not relevant if outside of search-radius or 
-				if (Translation.SizeSquared() > FMath::Square(BoidsSearchNearbyRadius) ||
-					(Directions[i] | Translation.GetSafeNormal()) <= -0.25) continue;
-				
-				OtherRelevantBoids.Add(j);
+				for (int32 Y = StartY; Y < EndY + 1; ++Y)
+				{
+					for (int32 X = StartX; X < EndX + 1; ++X)
+					{
+						const FVector CellLocation = GetCellLocation(FIntVector{X, Y, Z});
+						const bool bIntersects = FMath::SphereAABBIntersection(Transform.GetLocation(), FMath::Square(static_cast<double>(BoidsSearchNearbyRadius)), FBox{CellLocation - FVector{CELL_SIZE / 2.0}, CellLocation + FVector{CELL_SIZE / 2.0}});
+						
+						DrawDebugBox(GetWorld(), GetActorTransform().TransformPosition(GetCellLocation(FIntVector{X, Y, Z})), FVector{CELL_SIZE / 2.0}, bIntersects ? FColor::Cyan : FColor::Red);
+					}
+				}
 			}
-		}
+#endif
 
-		Cohere(Directions, i, OtherRelevantBoids);
-		Avoid(Directions, i, OtherRelevantBoids);
-		Align(Directions, i, OtherRelevantBoids);
-		Constrain(Directions[i], i);
+			ForEachNearbyBoid(Transform.GetLocation(), [&](const int32 BoidIndex, const FTransform& OtherTransform) -> void
+			{
+				const FVector Translation = FTransform::SubtractTranslations(Transform, OtherTransform);
+				if ((NewDirection | Translation) <= -0.25) return;
+				
+				OtherRelevantBoids.Add(BoidIndex);
+			});
+		}
+		
+		Cohere(NewDirection, Directions, i, OtherRelevantBoids);
+		Avoid(NewDirection, Directions, i, OtherRelevantBoids);
+		Align(NewDirection, Directions, i, OtherRelevantBoids);
+		Constrain(NewDirection, i);
+
+		Directions[i] = NewDirection;
 	}
 
 	for (int32 i = 0; i < NumInstances; ++i)
@@ -233,15 +287,94 @@ void AFlock::SimulateSynchronously(float DeltaTime)
 		FTransform Transform{NoInit};
 		Mesh->GetInstanceTransform(i, Transform);
 
+		const FVector PreviousLocation = Transform.GetLocation();
+
 		Transform.AddToTranslation(Directions[i] * MovementSpeed * DeltaTime);
 		Transform.SetRotation(Directions[i].ToOrientationQuat());
 		Mesh->UpdateInstanceTransform(i, Transform);
+
+		RelocateBoidCell(i, PreviousLocation, Transform.GetLocation());
 	}
 }
 
 void AFlock::SimulateAsynchronously(float DeltaTime)
 {
 	SCOPE_CYCLE_COUNTER(STAT_Simulate_GameThread);
+
+	TArray<FVector> Directions;
+	{
+		SCOPE_CYCLE_COUNTER(STAT_InitializeDirections);
+		
+		Directions.Reserve(NumInstances);
+		for (int32 i = 0; i < NumInstances; ++i)
+		{
+			FTransform Transform{NoInit};
+			verify(Mesh->GetInstanceTransform(i, Transform));
+			Directions.Add(Transform.GetUnitAxis(EAxis::X));
+		}
+	}
+
+	ParallelFor(NumInstances, [&](const int32 BoidIndex) -> void
+	{
+		FTransform Transform{NoInit};
+		Mesh->GetInstanceTransform(BoidIndex, Transform);
+
+		FVector NewDirection = Directions[BoidIndex];// Working with a copy rather than a reference to avoid false-sharing.
+
+		TArray<int32, TInlineAllocator<32>> OtherRelevantBoids;
+		{
+			SCOPE_CYCLE_COUNTER(STAT_FindNearbyBoids);
+			
+			ForEachNearbyBoid(Transform.GetLocation(), [&](const int32 OtherBoidIndex, const FTransform& OtherTransform) -> void
+			{
+				const FVector Translation = FTransform::SubtractTranslations(Transform, OtherTransform);
+				if ((NewDirection | Translation) <= -0.25) return;
+
+				OtherRelevantBoids.Add(OtherBoidIndex);
+			});
+		}
+		
+		Cohere(NewDirection, Directions, BoidIndex, OtherRelevantBoids);
+		Avoid(NewDirection, Directions, BoidIndex, OtherRelevantBoids);
+		Align(NewDirection, Directions, BoidIndex, OtherRelevantBoids);
+		Constrain(NewDirection, BoidIndex);
+
+		Directions[BoidIndex] = NewDirection;
+	});
+
+	// @NOTE: Doesn't scale as well as it should due to the blocking
+	ParallelFor(NumInstances, [&](const int32 BoidIndex) -> void
+	{
+		FTransform Transform{NoInit};
+		Mesh->GetInstanceTransform(BoidIndex, Transform);
+
+		const FVector PreviousLocation = Transform.GetLocation();
+
+		Transform.AddToTranslation(Directions[BoidIndex] * MovementSpeed * DeltaTime);
+		Transform.SetRotation(Directions[BoidIndex].ToOrientationQuat());
+		Mesh->UpdateInstanceTransform(BoidIndex, Transform);
+
+		SCOPE_CYCLE_COUNTER(STAT_RelocateBoidCells);
+		
+		{
+			const int32 PreviousCellIndex = GetCellIndex(PreviousLocation);
+			UE::TScopeLock Lock{BoidCellSpinLocks[PreviousCellIndex]};
+
+			verify(BoidCells[PreviousCellIndex].RemoveSingle(BoidIndex) != INDEX_NONE);
+
+			SCOPE_CYCLE_COUNTER(STAT_RelocateBoidCellsBlockingTime)
+		}
+
+		{
+			const int32 CellIndex = GetCellIndex(Transform.GetLocation());
+			UE::TScopeLock Lock{BoidCellSpinLocks[CellIndex]};
+
+			check(!BoidCells[CellIndex].Contains(BoidIndex));
+			BoidCells[CellIndex].Add(BoidIndex);
+
+			SCOPE_CYCLE_COUNTER(STAT_RelocateBoidCellsBlockingTime)
+		}
+	});
 }
 
 
@@ -249,7 +382,7 @@ void AFlock::Tick(float DeltaTime)
 {
 	Super::Tick(DeltaTime);
 
-	if (BoidSimulationCVars::UseMultithreading.GetValueOnGameThread())
+	if (BoidSimulationCVars::EnableMultithreading.GetValueOnGameThread())
 	{
 		SimulateAsynchronously(DeltaTime);
 	}

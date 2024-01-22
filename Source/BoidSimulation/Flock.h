@@ -95,7 +95,7 @@ protected:
 		};
 	}
 	
-	FORCEINLINE void ForEachNearbyBoid(const FVector& Location, const TFunctionRef<void(int32, const FTransform&)>& Functor) const
+	FORCEINLINE void ForEachNearbyBoid(const FVector& RESTRICT Location, const TConstArrayView<FVector>& RESTRICT OtherLocations, const TFunctionRef<void(int32, const FVector&)>& Functor) const
 	{
 		const int32 CellDimensions = GetCellDimensions();
 		
@@ -120,12 +120,9 @@ protected:
 					
 					for (const int32 OtherBoidIndex : BoidCells[GetCellIndex(CellCoordinates)])
 					{
-						FTransform OtherTransform{NoInit};
-						verify(Mesh->GetInstanceTransform(OtherBoidIndex, OtherTransform));
+						if (FVector::DistSquared(Location, OtherLocations[OtherBoidIndex]) > FMath::Square(BoidsSearchNearbyRadius)) continue;
 
-						if (FVector::DistSquared(Location, OtherTransform.GetLocation()) > FMath::Square(BoidsSearchNearbyRadius)) continue;
-
-						Functor(OtherBoidIndex, OtherTransform);
+						Functor(OtherBoidIndex, OtherLocations[OtherBoidIndex]);
 					}
 				}
 			}
@@ -134,10 +131,10 @@ protected:
 
 	void RelocateBoidCell(const int32 BoidIndex, const FVector& LastLocation, const FVector& NewLocation);
 
-	void Avoid(FVector& RESTRICT OutDirection, const TConstArrayView<FVector>& Directions, const int32 BoidIndex, const TConstArrayView<int32>& OtherRelevantBoidIndices) const;
-	void Align(FVector& RESTRICT OutDirection, const TConstArrayView<FVector>& Directions, const int32 BoidIndex, const TConstArrayView<int32>& OtherRelevantBoidIndices) const;
-	void Cohere(FVector& RESTRICT OutDirection, const TConstArrayView<FVector>& Directions, const int32 BoidIndex, const TConstArrayView<int32>& OtherRelevantBoidIndices) const;
-	void Constrain(FVector& RESTRICT OutDirection, const int32 BoidIndex) const;
+	void Avoid(FVector& RESTRICT OutDirection, const TConstArrayView<FVector>& Directions, const TConstArrayView<FVector>& Locations, const int32 BoidIndex, const TConstArrayView<int32>& OtherRelevantBoidIndices) const;
+	void Align(FVector& RESTRICT OutDirection, const TConstArrayView<FVector>& Directions, const TConstArrayView<FVector>& Locations, const int32 BoidIndex, const TConstArrayView<int32>& OtherRelevantBoidIndices) const;
+	void Cohere(FVector& RESTRICT OutDirection, const TConstArrayView<FVector>& Directions, const TConstArrayView<FVector>& Locations, const int32 BoidIndex, const TConstArrayView<int32>& OtherRelevantBoidIndices) const;
+	void Constrain(FVector& RESTRICT OutDirection, const FVector& RESTRICT Location, const int32 BoidIndex) const;
 
 	void SimulateSynchronously(float DeltaTime);
 	void SimulateAsynchronously(float DeltaTime);

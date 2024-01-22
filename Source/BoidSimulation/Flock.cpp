@@ -92,7 +92,7 @@ UE_NODISCARD FORCEINLINE FVector LerpNormals(const FVector& A, const FVector& B,
 	return FQuat{Axis, Angle * Alpha}.RotateVector(A);
 }
 
-void AFlock::Cohere(FVector& RESTRICT OutDirection, const TConstArrayView<FVector>& Directions, const int32 BoidIndex, const TConstArrayView<int32>& OtherRelevantBoidIndices) const
+void AFlock::Cohere(FVector& RESTRICT OutDirection, const TConstArrayView<FVector>& Directions, const TConstArrayView<FVector>& Locations, const int32 BoidIndex, const TConstArrayView<int32>& OtherRelevantBoidIndices) const
 {
 	DECLARE_SCOPE_CYCLE_COUNTER(TEXT("Cohere"), STAT_Cohere, STATGROUP_BoidSimulation);
 
@@ -107,11 +107,8 @@ void AFlock::Cohere(FVector& RESTRICT OutDirection, const TConstArrayView<FVecto
 		AverageLocation += OtherTransform.GetTranslation();
 	}
 	AverageLocation /= OtherRelevantBoidIndices.Num();
-
-	FTransform Transform{NoInit};
-	Mesh->GetInstanceTransform(BoidIndex, Transform);
-
-	const FVector DirToAverageLocation = (AverageLocation - Transform.GetTranslation()).GetSafeNormal();
+	
+	const FVector DirToAverageLocation = (AverageLocation - Locations[BoidIndex]).GetSafeNormal();
 	
 	const double Alpha = FMath::GetMappedRangeValueClamped<double, double>({0.0, 15.0}, {0.0, BoidSimulationCVars::CohesionStrength.GetValueOnAnyThread()}, static_cast<double>(OtherRelevantBoidIndices.Num()));
 	OutDirection = LerpNormals(OutDirection, DirToAverageLocation, Alpha);
@@ -130,21 +127,15 @@ void AFlock::RelocateBoidCell(const int32 BoidIndex, const FVector& LastLocation
 	BoidCells[NewCell].Add(BoidIndex);
 }
 
-void AFlock::Avoid(FVector& RESTRICT OutDirection, const TConstArrayView<FVector>& Directions, const int32 BoidIndex, const TConstArrayView<int32>& OtherRelevantBoidIndices) const
+void AFlock::Avoid(FVector& RESTRICT OutDirection, const TConstArrayView<FVector>& Directions, const TConstArrayView<FVector>& Locations, const int32 BoidIndex, const TConstArrayView<int32>& OtherRelevantBoidIndices) const
 {
 	DECLARE_SCOPE_CYCLE_COUNTER(TEXT("Avoid"), STAT_Avoid, STATGROUP_BoidSimulation);
-	
-	FTransform Transform{NoInit};
-	Mesh->GetInstanceTransform(BoidIndex, Transform);
 
 	FVector NewDirection = OutDirection;
 
 	for (const int32 OtherBoidIndex : OtherRelevantBoidIndices)
 	{
-		FTransform OtherTransform{NoInit};
-		Mesh->GetInstanceTransform(OtherBoidIndex, OtherTransform);
-
-		const FVector Translation = FTransform::SubtractTranslations(Transform, OtherTransform);
+		const FVector Translation = Locations[BoidIndex] - Locations[OtherBoidIndex];
 		if (UNLIKELY(Translation.SizeSquared() < UE_DOUBLE_KINDA_SMALL_NUMBER)) continue;
 		
 		const double Dist = Translation.Size();
@@ -157,7 +148,7 @@ void AFlock::Avoid(FVector& RESTRICT OutDirection, const TConstArrayView<FVector
 	OutDirection = NewDirection;
 }
 
-void AFlock::Align(FVector& RESTRICT OutDirection, const TConstArrayView<FVector>& Directions, const int32 BoidIndex, const TConstArrayView<int32>& OtherRelevantBoidIndices) const
+void AFlock::Align(FVector& RESTRICT OutDirection, const TConstArrayView<FVector>& Directions, const TConstArrayView<FVector>& Locations, const int32 BoidIndex, const TConstArrayView<int32>& OtherRelevantBoidIndices) const
 {
 	DECLARE_SCOPE_CYCLE_COUNTER(TEXT("Align"), STAT_Align, STATGROUP_BoidSimulation);
 
@@ -175,18 +166,15 @@ void AFlock::Align(FVector& RESTRICT OutDirection, const TConstArrayView<FVector
 	OutDirection = LerpNormals(OutDirection, AverageDirection, Alpha);
 }
 
-void AFlock::Constrain(FVector& OutDirection, const int32 BoidIndex) const
+void AFlock::Constrain(FVector& RESTRICT OutDirection, const FVector& RESTRICT Location, const int32 BoidIndex) const
 {
 	DECLARE_SCOPE_CYCLE_COUNTER(TEXT("Constrain"), STAT_Constrain, STATGROUP_BoidSimulation);
 	
-	FTransform Transform{NoInit};
-	Mesh->GetInstanceTransform(BoidIndex, Transform);
-	
 	// Confine to bounds
-	if (Transform.GetTranslation().SizeSquared() > FMath::Square(BoundsRadius - BoidsSearchNearbyRadius - UE_DOUBLE_KINDA_SMALL_NUMBER))
+	if (Location.SizeSquared() > FMath::Square(BoundsRadius - BoidsSearchNearbyRadius - UE_DOUBLE_KINDA_SMALL_NUMBER))
 	{
-		const double DistFromOrigin = Transform.GetTranslation().Size();
-		const FVector DirFromOrigin = Transform.GetTranslation() / DistFromOrigin;
+		const double DistFromOrigin = Location.Size();
+		const FVector DirFromOrigin = Location / DistFromOrigin;
 		
 		FVector RightAxis = OutDirection ^ DirFromOrigin;
 		
@@ -208,6 +196,7 @@ void AFlock::Constrain(FVector& OutDirection, const int32 BoidIndex) const
 
 void AFlock::SimulateSynchronously(float DeltaTime)
 {
+#if 0
 	SCOPE_CYCLE_COUNTER(STAT_Simulate_GameThread);
 	
 	TArray<FVector> Directions;
@@ -295,49 +284,55 @@ void AFlock::SimulateSynchronously(float DeltaTime)
 
 		RelocateBoidCell(i, PreviousLocation, Transform.GetLocation());
 	}
+#endif
 }
 
 void AFlock::SimulateAsynchronously(float DeltaTime)
 {
 	SCOPE_CYCLE_COUNTER(STAT_Simulate_GameThread);
 
-	TArray<FVector> Directions;
+	FMemMark Mark{FMemStack::Get()};
+
+	TArray<FVector, TMemStackAllocator<>> Locations;
+	TArray<FVector, TMemStackAllocator<>> Directions;
 	{
-		SCOPE_CYCLE_COUNTER(STAT_InitializeDirections);
-		
-		Directions.Reserve(NumInstances);
-		for (int32 i = 0; i < NumInstances; ++i)
+		DECLARE_SCOPE_CYCLE_COUNTER(TEXT("Initialize Buffers"), STAT_InitializeBuffers, STATGROUP_BoidSimulation);
+
+		Locations.SetNumUninitialized(NumInstances);
+		Directions.SetNumUninitialized(NumInstances);
+
+		ParallelFor(NumInstances, [&](const int32 i) -> void
 		{
 			FTransform Transform{NoInit};
 			verify(Mesh->GetInstanceTransform(i, Transform));
-			Directions.Add(Transform.GetUnitAxis(EAxis::X));
-		}
+			Locations[i] = Transform.GetTranslation();
+			Directions[i] = Transform.GetUnitAxis(EAxis::X);
+		});
 	}
 
 	ParallelFor(NumInstances, [&](const int32 BoidIndex) -> void
 	{
-		FTransform Transform{NoInit};
-		Mesh->GetInstanceTransform(BoidIndex, Transform);
-
 		FVector NewDirection = Directions[BoidIndex];// Working with a copy rather than a reference to avoid false-sharing.
 
 		TArray<int32, TInlineAllocator<32>> OtherRelevantBoids;
 		{
 			SCOPE_CYCLE_COUNTER(STAT_FindNearbyBoids);
 			
-			ForEachNearbyBoid(Transform.GetLocation(), [&](const int32 OtherBoidIndex, const FTransform& OtherTransform) -> void
+			ForEachNearbyBoid(Locations[BoidIndex], Locations, [&](const int32 OtherBoidIndex, const FVector& RESTRICT OtherLocation) -> void
 			{
-				const FVector Translation = FTransform::SubtractTranslations(Transform, OtherTransform);
+				if (BoidIndex == OtherBoidIndex) return;
+				
+				const FVector Translation = Locations[BoidIndex] - OtherLocation;
 				if ((NewDirection | Translation) <= -0.25) return;
 
 				OtherRelevantBoids.Add(OtherBoidIndex);
 			});
 		}
 		
-		Cohere(NewDirection, Directions, BoidIndex, OtherRelevantBoids);
-		Avoid(NewDirection, Directions, BoidIndex, OtherRelevantBoids);
-		Align(NewDirection, Directions, BoidIndex, OtherRelevantBoids);
-		Constrain(NewDirection, BoidIndex);
+		Cohere(NewDirection, Directions, Locations, BoidIndex, OtherRelevantBoids);
+		Avoid(NewDirection, Directions, Locations, BoidIndex, OtherRelevantBoids);
+		Align(NewDirection, Directions, Locations, BoidIndex, OtherRelevantBoids);
+		Constrain(NewDirection, Locations[BoidIndex], BoidIndex);
 
 		Directions[BoidIndex] = NewDirection;
 	});
@@ -345,14 +340,12 @@ void AFlock::SimulateAsynchronously(float DeltaTime)
 	// @NOTE: Doesn't scale as well as it should due to the blocking
 	ParallelFor(NumInstances, [&](const int32 BoidIndex) -> void
 	{
-		FTransform Transform{NoInit};
-		Mesh->GetInstanceTransform(BoidIndex, Transform);
+		FVector& RESTRICT Location = Locations[BoidIndex];
+		const FVector PreviousLocation = Location;
 
-		const FVector PreviousLocation = Transform.GetLocation();
-
-		Transform.AddToTranslation(Directions[BoidIndex] * MovementSpeed * DeltaTime);
-		Transform.SetRotation(Directions[BoidIndex].ToOrientationQuat());
-		Mesh->UpdateInstanceTransform(BoidIndex, Transform);
+		Location += Directions[BoidIndex] * MovementSpeed * DeltaTime;
+		
+		Mesh->UpdateInstanceTransform(BoidIndex, FTransform{Directions[BoidIndex].ToOrientationQuat(), Location});
 
 		SCOPE_CYCLE_COUNTER(STAT_RelocateBoidCells);
 		
@@ -366,7 +359,7 @@ void AFlock::SimulateAsynchronously(float DeltaTime)
 		}
 
 		{
-			const int32 CellIndex = GetCellIndex(Transform.GetLocation());
+			const int32 CellIndex = GetCellIndex(Location);
 			UE::TScopeLock Lock{BoidCellSpinLocks[CellIndex]};
 
 			check(!BoidCells[CellIndex].Contains(BoidIndex));
